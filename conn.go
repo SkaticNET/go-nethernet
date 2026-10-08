@@ -78,6 +78,9 @@ type Conn struct {
 	// NetherNet fragment header.
 	maxSegmentPayload atomic.Uint32
 
+	observeTransportState  func(*Conn, TransportLayer, TransportState)
+	observeDataChannelOpen func(*Conn, MessageReliability)
+
 	readMu  sync.Mutex
 	readBuf []byte
 
@@ -377,12 +380,14 @@ func isTerminalICEState(state webrtc.ICETransportState) bool {
 // error has occurred in any of the underlying transports and data channels.
 func (conn *Conn) handleTransports() {
 	conn.ice.OnConnectionStateChange(func(state webrtc.ICETransportState) {
+		conn.observeTransport(TransportLayerICE, TransportState(state.String()))
 		if isTerminalICEState(state) {
 			// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
 			go conn.close(fmt.Errorf("nethernet: ICE transport entered unrecoverable state: %s", state))
 		}
 	})
 	conn.dtls.OnStateChange(func(state webrtc.DTLSTransportState) {
+		conn.observeTransport(TransportLayerDTLS, TransportState(state.String()))
 		switch state {
 		case webrtc.DTLSTransportStateClosed, webrtc.DTLSTransportStateFailed:
 			// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
@@ -391,6 +396,7 @@ func (conn *Conn) handleTransports() {
 		}
 	})
 	conn.sctp.OnClose(func(err error) {
+		conn.observeTransport(TransportLayerSCTP, TransportState(conn.sctp.State().String()))
 		var e error
 		if err != nil {
 			e = fmt.Errorf("nethernet: SCTP transport closed: %w", err)
@@ -400,6 +406,12 @@ func (conn *Conn) handleTransports() {
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
 		go conn.close(e)
 	})
+}
+
+func (conn *Conn) observeTransport(layer TransportLayer, state TransportState) {
+	if observe := conn.observeTransportState; observe != nil {
+		observe(conn, layer, state)
+	}
 }
 
 // handleSignal handles an incoming Signal signaled from the remote connection.
@@ -601,6 +613,45 @@ func parseDescription(d *sdp.SessionDescription) (*description, error) {
 		identity:   identity,
 		candidates: candidates,
 	}, nil
+}
+
+func summarizeRemoteDescription(d *sdp.SessionDescription, desc *description) RemoteDescriptionStats {
+	stats := RemoteDescriptionStats{
+		MediaSections:     len(d.MediaDescriptions),
+		CandidateCount:    len(desc.candidates),
+		HasICECredentials: desc.ice.UsernameFragment != "" && desc.ice.Password != "",
+		HasFingerprint:    len(desc.dtls.Fingerprints) > 0,
+		HasSCTP:           desc.sctp.MaxMessageSize > 0,
+		DTLSRole:          desc.dtls.Role.String(),
+	}
+	for _, attribute := range d.Attributes {
+		if strings.EqualFold(attribute.Key, "group") {
+			fields := strings.Fields(attribute.Value)
+			if len(fields) > 0 && strings.EqualFold(fields[0], "BUNDLE") {
+				stats.HasBundle = true
+			}
+		}
+		if strings.EqualFold(attribute.Key, "ice-options") && containsTrickle(strings.Fields(attribute.Value)) {
+			stats.HasTrickle = true
+		}
+	}
+	for _, media := range d.MediaDescriptions {
+		for _, attribute := range media.Attributes {
+			if strings.EqualFold(attribute.Key, "ice-options") && containsTrickle(strings.Fields(attribute.Value)) {
+				stats.HasTrickle = true
+			}
+		}
+	}
+	return stats
+}
+
+func containsTrickle(options []string) bool {
+	for _, option := range options {
+		if strings.EqualFold(option, "trickle") {
+			return true
+		}
+	}
+	return false
 }
 
 // gatherCandidates blocks until local ICE gathering completes and returns every

@@ -42,6 +42,17 @@ type ListenConfig struct {
 	// It may be called concurrently for different connections.
 	ConnContext func(parent context.Context, conn *Conn) (context.Context, context.CancelFunc)
 
+	// ObserveRemoteDescription reports bounded structural metadata after a remote SDP description is parsed.
+	// It never exposes SDP attributes, candidates, credentials, identity assertions, or addresses.
+	ObserveRemoteDescription func(conn *Conn, stats RemoteDescriptionStats)
+
+	// ObserveTransportState reports allowlisted transport states without exposing errors or identifiers.
+	// It may run synchronously from a Pion callback and should return quickly without calling Conn methods.
+	ObserveTransportState func(conn *Conn, layer TransportLayer, state TransportState)
+
+	// ObserveDataChannelOpen reports which reliability class opened, without exposing channel labels or data.
+	ObserveDataChannelOpen func(conn *Conn, reliability MessageReliability)
+
 	// NegotiationContext provides a [context.Context] for the negotiation. If nil, a default [context.Context]
 	// with 5 seconds timeout will be used. The parent [context.Context] may be used to create a [context.Context]
 	// to be returned (likely using [context.WithCancel] or [context.WithTimeout]). If the deadline of the context
@@ -129,6 +140,30 @@ type ListenConfig struct {
 	// 'nethernet-disable-trickle-ice' setting property set to 'true'.
 	DisableTrickleICE bool
 }
+
+// RemoteDescriptionStats contains structural metadata from a successfully parsed remote description.
+type RemoteDescriptionStats struct {
+	MediaSections     int
+	CandidateCount    int
+	HasICECredentials bool
+	HasFingerprint    bool
+	HasSCTP           bool
+	HasBundle         bool
+	HasTrickle        bool
+	DTLSRole          string
+}
+
+// TransportLayer identifies an underlying transport at a lifecycle hook.
+type TransportLayer string
+
+const (
+	TransportLayerICE         TransportLayer = "ice"
+	TransportLayerDTLS        TransportLayer = "dtls"
+	TransportLayerSCTP        TransportLayer = "sctp"
+)
+
+// TransportState is a Pion transport state or one of the fixed start markers.
+type TransportState string
 
 // Listen listens on the local network ID specified by the Signaling implementation. It returns a Listener
 // that may be used to accept established connections from [Listener.Accept]. Signaling will be used to notify
@@ -460,6 +495,11 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 	if err != nil {
 		return fmt.Errorf("create peer connection: %w", err)
 	}
+	c.observeTransportState = n.conf.ObserveTransportState
+	c.observeDataChannelOpen = n.conf.ObserveDataChannelOpen
+	if observe := n.conf.ObserveRemoteDescription; observe != nil {
+		observe(c, summarizeRemoteDescription(d, desc))
+	}
 	established := false
 	defer func() {
 		if !established {
@@ -530,6 +570,9 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 					return
 				}
 				channel.OnOpen(sync.OnceFunc(func() {
+					if observe := c.observeDataChannelOpen; observe != nil {
+						observe(c, r)
+					}
 					// If all data channels have been opened by remote peer, we can signal that the connection is ready.
 					if opened.Add(1) == uint32(messageReliabilityCapacity) {
 						close(channelsReady)
@@ -690,20 +733,27 @@ func (n *listenerNegotiator) finaliseConn(conn *Conn, d *description, channelsRe
 // [context.Context] is used to control the deadline.
 func (n *listenerNegotiator) startTransports(ctx context.Context, conn *Conn, d *description, channelsReady <-chan struct{}) error {
 	conn.log.Debug("starting ICE transport as controlled")
+	conn.observeTransport(TransportLayerICE, "starting")
 	iceRole := webrtc.ICERoleControlled
 	if err := conn.ice.StartContext(ctx, nil, d.ice, &iceRole); err != nil {
+		conn.observeTransport(TransportLayerICE, "failed")
 		return fmt.Errorf("start ICE: %w", err)
 	}
 
 	conn.log.Debug("starting DTLS transport", slog.String("remoteRole", d.dtls.Role.String()))
+	conn.observeTransport(TransportLayerDTLS, "starting")
 	if err := conn.dtls.StartContext(ctx, d.dtls); err != nil {
+		conn.observeTransport(TransportLayerDTLS, "failed")
 		return fmt.Errorf("start DTLS: %w", err)
 	}
 
 	conn.log.Debug("starting SCTP transport")
+	conn.observeTransport(TransportLayerSCTP, "connecting")
 	if err := conn.sctp.StartContext(ctx, d.sctp); err != nil {
+		conn.observeTransport(TransportLayerSCTP, TransportState(conn.sctp.State().String()))
 		return fmt.Errorf("start SCTP: %w", err)
 	}
+	conn.observeTransport(TransportLayerSCTP, TransportState(conn.sctp.State().String()))
 	conn.maxSegmentPayload.Store(conn.sctp.GetCapabilities().MaxMessageSize - 1)
 
 	return n.waitForChannelsReady(ctx, conn, channelsReady)
