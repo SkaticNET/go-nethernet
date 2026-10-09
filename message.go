@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"slices"
 	"sync"
 
 	"github.com/pion/webrtc/v4"
@@ -85,6 +86,7 @@ func (r MessageReliability) compareOptional(a, b *uint16) bool {
 func wrapDataChannel(channel *webrtc.DataChannel, reliability MessageReliability, conn *Conn) *dataChannel {
 	ch := &dataChannel{
 		DataChannel: channel,
+		conn:        conn,
 		reliability: reliability,
 		// Previously, message.data was pre-allocated for all possible segments.
 		// Since most messages are smaller than 256KB and don't require fragmentation,
@@ -94,7 +96,9 @@ func wrapDataChannel(channel *webrtc.DataChannel, reliability MessageReliability
 		close:   make(chan struct{}),
 	}
 	ch.OnMessage(func(msg webrtc.DataChannelMessage) {
-		if err := ch.handleMessage(msg.Data); err != nil {
+		event, err := ch.handleMessage(msg.Data, msg.IsString)
+		ch.observeMessage(event)
+		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				conn.log.Debug("message dropped due to closure of data channel",
 					slog.String("label", ch.Label()))
@@ -119,6 +123,7 @@ func wrapDataChannel(channel *webrtc.DataChannel, reliability MessageReliability
 // within a Conn. It contains the fields necessary for handling multiple segments received in the embedded [webrtc.DataChannel].
 type dataChannel struct {
 	*webrtc.DataChannel
+	conn *Conn
 
 	// An embedded message contains the buffer that holds the segments received
 	// to now and the count of the last segment count.
@@ -149,6 +154,10 @@ type dataChannel struct {
 type message struct {
 	// segments represents the number of segments the message is split into.
 	segments uint8
+	// totalSegments is set from the first segment and used to report message-relative indices.
+	totalSegments int
+	// receivedSegments counts accepted segments for the current message.
+	receivedSegments int
 	// data represents the payload of the message.
 	data []byte
 }
@@ -168,44 +177,150 @@ func parseMessage(b []byte) (*message, error) {
 // handleMessage handles a message received from a [webrtc.DataChannel] for the reliability. It parses
 // the incoming data into a message using parseMessage and handles the segments, and if all segments has
 // been received, it sends the buffer to either [Conn.Read] or [Conn.ReadPacket].
-func (c *dataChannel) handleMessage(b []byte) error {
+func (c *dataChannel) handleMessage(b []byte, isString bool) (DataChannelMessageObservation, error) {
+	var event DataChannelMessageObservation
+	observing := c.conn != nil && c.conn.observeDataChannelMessage != nil
+	if observing {
+		event = c.observation(DataChannelMessageInbound, isString)
+		// The observer copies Pion's callback-owned buffer once immediately
+		// before invoking user code.
+		event.Data = b
+		event.ParseOutcome = MessageParseNotAttempted
+		event.ReassemblyOutcome = MessageReassemblyNotApplicable
+	}
 	select {
 	case <-c.close:
-		return net.ErrClosed
+		if observing {
+			event.Err = net.ErrClosed
+		}
+		return event, net.ErrClosed
 	default:
 	}
 
 	msg, err := parseMessage(b)
 	if err != nil {
-		return fmt.Errorf("parse: %w", err)
+		err = fmt.Errorf("parse: %w", err)
+		if observing {
+			event.ParseOutcome = MessageParseInvalid
+			event.ReassemblyOutcome = MessageReassemblyFailed
+			event.Err = err
+		}
+		return event, err
+	}
+	if observing {
+		event.ParseOutcome = MessageParseValid
+		event.SegmentCount = int(msg.segments) + 1
+		event.SegmentIndex = 0
+		event.ReassemblyOutcome = MessageReassemblyPending
 	}
 
 	if c.reliability == MessageReliabilityUnreliable && msg.segments > 0 {
-		return fmt.Errorf("unexpected segment count on UnreliableDataChannel: %d", msg.segments)
+		err = fmt.Errorf("unexpected segment count on UnreliableDataChannel: %d", msg.segments)
+		if observing {
+			event.ReassemblyOutcome = MessageReassemblyFailed
+			event.Err = err
+		}
+		return event, err
 	}
 
 	c.messageMu.Lock()
-	defer c.messageMu.Unlock()
-
 	if c.segments > 0 && c.segments-1 != msg.segments {
-		return fmt.Errorf("invalid promised segments: expected %d, got %d", c.segments-1, msg.segments)
+		err = fmt.Errorf("invalid promised segments: expected %d, got %d", c.segments-1, msg.segments)
+		if observing {
+			event.SegmentCount = c.totalSegments
+			event.SegmentIndex = c.receivedSegments
+			event.ReassemblyOutcome = MessageReassemblyFailed
+			event.Err = err
+		}
+		c.messageMu.Unlock()
+		return event, err
 	}
 
+	if c.receivedSegments == 0 {
+		c.totalSegments = int(msg.segments) + 1
+	}
+	if observing {
+		event.SegmentCount = c.totalSegments
+		event.SegmentIndex = c.receivedSegments
+	}
 	c.segments = msg.segments
 	c.data = append(c.data, msg.data...)
+	c.receivedSegments++
 
 	if c.segments > 0 {
-		return nil
+		c.messageMu.Unlock()
+		return event, nil
 	}
+	if observing {
+		event.ReassemblyOutcome = MessageReassemblyComplete
+		// c.data is handed to the packet receiver below, so the observation
+		// needs its own one-time copy before that ownership transfer.
+		event.ReassembledData = slices.Clone(c.data)
+	}
+	c.totalSegments = 0
+	c.receivedSegments = 0
 
 	select {
 	case <-c.close:
-		return net.ErrClosed
+		err = net.ErrClosed
 	case c.packets <- c.data:
 		c.data = nil
 	}
+	c.messageMu.Unlock()
+	if err != nil {
+		if observing {
+			event.Err = err
+		}
+	}
 
-	return nil
+	return event, err
+}
+
+func (c *dataChannel) observation(direction DataChannelMessageDirection, isString bool) DataChannelMessageObservation {
+	event := DataChannelMessageObservation{
+		Direction:         direction,
+		Reliability:       c.reliability,
+		IsString:          isString,
+		ReassemblyOutcome: MessageReassemblyNotApplicable,
+	}
+	if c.conn != nil {
+		event.ConnectionID = c.conn.id
+	}
+	if c.DataChannel != nil {
+		event.Label = c.Label()
+		event.Protocol = c.Protocol()
+		event.Ordered = c.Ordered()
+		event.Negotiated = c.Negotiated()
+		event.BufferedAmount = c.BufferedAmount()
+		if streamID := c.ID(); streamID != nil {
+			event.StreamID = *streamID
+			event.HasStreamID = true
+		}
+		event.MaxRetransmits = c.MaxRetransmits()
+		event.MaxPacketLifeTime = c.MaxPacketLifeTime()
+	}
+	return event
+}
+
+func (c *dataChannel) observeMessage(event DataChannelMessageObservation) {
+	if c.conn == nil {
+		return
+	}
+	if observe := c.conn.observeDataChannelMessage; observe != nil {
+		// Pion owns the OnMessage buffer. Clone it before handing the event to user code.
+		event.Data = slices.Clone(event.Data)
+		event.MaxRetransmits = cloneUint16(event.MaxRetransmits)
+		event.MaxPacketLifeTime = cloneUint16(event.MaxPacketLifeTime)
+		observe(event)
+	}
+}
+
+func cloneUint16(value *uint16) *uint16 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 // Close closes the underlying [webrtc.DataChannel].

@@ -53,6 +53,29 @@ type ListenConfig struct {
 	// ObserveDataChannelOpen reports which reliability class opened, without exposing channel labels or data.
 	ObserveDataChannelOpen func(conn *Conn, reliability MessageReliability)
 
+	// ObserveDataChannelMessage reports each decrypted Pion DataChannel message received by or sent through
+	// a Listener Conn. Data includes NetherNet's segment counter. Incoming messages also report the parse and
+	// reassembly result, with ReassembledData set when a complete message is available. Byte slices and optional
+	// values are independent copies owned by the observer. This opt-in callback may receive Login packets and
+	// credentials. It is synchronous, may run on Pion's callback thread or the caller of Conn.Send, and should
+	// return quickly without calling blocking Conn methods.
+	ObserveDataChannelMessage func(DataChannelMessageObservation)
+
+	// ObserveTransportSnapshot reports a snapshot after transport changes, selected-candidate changes,
+	// channel opens, readiness, and connection closure. It includes raw local and remote descriptions, ICE credentials and
+	// full ICE candidates, public DTLS fingerprints/certificates, and SCTP statistics. It does not log or persist
+	// data by itself. Without this callback, raw descriptions and remote ICE credentials are not retained by Conn.
+	// Calls are serialized on a bounded per-Conn worker; intermediate requests are coalesced and the cumulative
+	// number omitted is reported as DroppedSnapshotEvents. A close snapshot is sampled before teardown and marked
+	// with TransportSnapshotPhasePreClose. The callback should return quickly.
+	ObserveTransportSnapshot func(TransportSnapshotObservation)
+
+	// ObserveConnectionState reports when a Listener Conn becomes ready and when it closes. Err is the
+	// connection close cause, or nil for the ready state. Events are delivered in lifecycle order on a per-Conn
+	// worker, so Ready can never follow Closed. DroppedSnapshotEvents reports the cumulative number of transport
+	// snapshot updates omitted for this Conn. The callback should return quickly.
+	ObserveConnectionState func(ConnectionStateObservation)
+
 	// NegotiationContext provides a [context.Context] for the negotiation. If nil, a default [context.Context]
 	// with 5 seconds timeout will be used. The parent [context.Context] may be used to create a [context.Context]
 	// to be returned (likely using [context.WithCancel] or [context.WithTimeout]). If the deadline of the context
@@ -153,13 +176,147 @@ type RemoteDescriptionStats struct {
 	DTLSRole          string
 }
 
+// DataChannelMessageDirection identifies traffic relative to this Conn.
+type DataChannelMessageDirection string
+
+const (
+	DataChannelMessageInbound  DataChannelMessageDirection = "inbound"
+	DataChannelMessageOutbound DataChannelMessageDirection = "outbound"
+)
+
+// MessageParseOutcome describes parsing of the NetherNet segment header.
+type MessageParseOutcome string
+
+const (
+	MessageParseNotAttempted MessageParseOutcome = "not_attempted"
+	MessageParseValid        MessageParseOutcome = "valid"
+	MessageParseInvalid      MessageParseOutcome = "invalid"
+)
+
+// MessageReassemblyOutcome describes the result of handling a message's segments.
+type MessageReassemblyOutcome string
+
+const (
+	MessageReassemblyNotApplicable MessageReassemblyOutcome = "not_applicable"
+	MessageReassemblyPending       MessageReassemblyOutcome = "pending"
+	MessageReassemblyComplete      MessageReassemblyOutcome = "complete"
+	MessageReassemblyFailed        MessageReassemblyOutcome = "failed"
+)
+
+// DataChannelMessageObservation is emitted for each DataChannel message. Data is an independently owned
+// copy of the exact bytes passed to or received from Pion, including the NetherNet segment counter. On
+// inbound completion, ReassembledData is an independent copy of the full message without that counter.
+// Err contains a parse, reassembly, or send error. ConnectionID matches the signaled NetherNet connection.
+type DataChannelMessageObservation struct {
+	ConnectionID      uint64
+	Direction         DataChannelMessageDirection
+	StreamID          uint16
+	HasStreamID       bool
+	Label             string
+	Protocol          string
+	Reliability       MessageReliability
+	Ordered           bool
+	Negotiated        bool
+	MaxRetransmits    *uint16
+	MaxPacketLifeTime *uint16
+	BufferedAmount    uint64
+	IsString          bool
+	SegmentIndex      int
+	SegmentCount      int
+	ParseOutcome      MessageParseOutcome
+	ReassemblyOutcome MessageReassemblyOutcome
+	Data              []byte
+	ReassembledData   []byte
+	Err               error
+}
+
+// ConnectionState identifies the observable lifecycle states of a Listener Conn.
+type ConnectionState string
+
+const (
+	ConnectionStateReady  ConnectionState = "ready"
+	ConnectionStateClosed ConnectionState = "closed"
+)
+
+// ConnectionStateObservation correlates a ready or closed Conn with its signaling connection ID.
+type ConnectionStateObservation struct {
+	ConnectionID uint64
+	State        ConnectionState
+	Err          error
+	// DroppedSnapshotEvents is the cumulative number of coalesced or omitted snapshots for this Conn.
+	DroppedSnapshotEvents uint64
+}
+
+// TransportSnapshotObservation correlates a TransportSnapshot with its signaling connection ID.
+type TransportSnapshotObservation struct {
+	ConnectionID uint64
+	Snapshot     TransportSnapshot
+}
+
+// TransportSnapshot contains transport values available from this package and Pion's public APIs.
+// Candidate addresses, ICE credentials, DTLS certificates/fingerprints, and raw SCTP init bytes are included
+// because this type is only delivered through the explicitly configured observer callback.
+type TransportSnapshot struct {
+	// Phase is current for active samples and pre-close for the final sample taken before teardown.
+	Phase TransportSnapshotPhase
+	// DroppedSnapshotEvents is the cumulative number of coalesced or omitted snapshot requests.
+	DroppedSnapshotEvents uint64
+	LocalDescription      string
+	HasLocalDescription   bool
+	RemoteDescription     string
+	HasRemoteDescription  bool
+	ICEState              TransportState
+	ICEGathererState      TransportState
+	ICERole               string
+	// ICEStats contains byte and packet counters exposed by ICETransport.Stats.
+	ICEStats                      webrtc.TransportStats
+	LocalICEParameters            webrtc.ICEParameters
+	HasLocalICEParameters         bool
+	RemoteICEParameters           webrtc.ICEParameters
+	HasRemoteICEParameters        bool
+	LocalCandidates               []webrtc.ICECandidate
+	HasLocalCandidates            bool
+	RemoteCandidates              []webrtc.ICECandidate
+	HasRemoteCandidates           bool
+	SelectedCandidatePair         *webrtc.ICECandidatePair
+	SelectedCandidatePairStats    webrtc.ICECandidatePairStats
+	HasSelectedCandidatePairStats bool
+	DTLSState                     TransportState
+	LocalDTLSParameters           webrtc.DTLSParameters
+	HasLocalDTLSParameters        bool
+	RemoteDTLSParameters          webrtc.DTLSParameters
+	HasRemoteDTLSParameters       bool
+	RemoteCertificate             []byte
+	SCTPState                     TransportState
+	LocalSCTPCapabilities         webrtc.SCTPCapabilities
+	HasLocalSCTPCapabilities      bool
+	RemoteSCTPCapabilities        webrtc.SCTPCapabilities
+	HasRemoteSCTPCapabilities     bool
+	SCTPStats                     webrtc.SCTPTransportStats
+	SCTPInit                      []byte
+	SCTPMaxChannels               uint16
+	SCTPBufferedAmount            int
+	SCTPMetadata                  webrtc.SCTPTransportMetadata
+	HasSCTPMetadata               bool
+}
+
+// TransportSnapshotPhase identifies when a snapshot was sampled relative to Conn closure.
+type TransportSnapshotPhase string
+
+const (
+	// TransportSnapshotPhaseCurrent means the snapshot was sampled while the Conn was active.
+	TransportSnapshotPhaseCurrent TransportSnapshotPhase = "current"
+	// TransportSnapshotPhasePreClose means the snapshot was sampled before transport teardown.
+	TransportSnapshotPhasePreClose TransportSnapshotPhase = "pre-close"
+)
+
 // TransportLayer identifies an underlying transport at a lifecycle hook.
 type TransportLayer string
 
 const (
-	TransportLayerICE         TransportLayer = "ice"
-	TransportLayerDTLS        TransportLayer = "dtls"
-	TransportLayerSCTP        TransportLayer = "sctp"
+	TransportLayerICE  TransportLayer = "ice"
+	TransportLayerDTLS TransportLayer = "dtls"
+	TransportLayerSCTP TransportLayer = "sctp"
 )
 
 // TransportState is a Pion transport state or one of the fixed start markers.
@@ -495,8 +652,20 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 	if err != nil {
 		return fmt.Errorf("create peer connection: %w", err)
 	}
+	if n.conf.ObserveTransportSnapshot != nil {
+		// These values include raw SDP and ICE credentials, so keep them only for
+		// an explicitly opted-in transport observer.
+		c.remoteDescription = signal.Data
+		c.remoteICEParameters = desc.ice
+		c.remoteDTLSParameters = cloneDTLSParameters(desc.dtls)
+		c.remoteSCTPCapabilities = desc.sctp
+		c.hasRemoteDescription = true
+	}
 	c.observeTransportState = n.conf.ObserveTransportState
 	c.observeDataChannelOpen = n.conf.ObserveDataChannelOpen
+	c.observeDataChannelMessage = n.conf.ObserveDataChannelMessage
+	c.startSnapshotObserver(n.conf.ObserveTransportSnapshot)
+	c.startLifecycleObserver(n.conf.ObserveConnectionState)
 	if observe := n.conf.ObserveRemoteDescription; observe != nil {
 		observe(c, summarizeRemoteDescription(d, desc))
 	}
@@ -570,6 +739,7 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 					return
 				}
 				channel.OnOpen(sync.OnceFunc(func() {
+					c.emitTransportSnapshotAsync()
 					if observe := c.observeDataChannelOpen; observe != nil {
 						observe(c, r)
 					}
@@ -588,6 +758,9 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 	answer, err := c.description.encode()
 	if err != nil {
 		return wrapSignalError(fmt.Errorf("encode answer: %w", err), ErrorCodeFailedToCreateAnswer)
+	}
+	if c.observeTransportSnapshot != nil {
+		c.localDescription = string(answer)
 	}
 
 	if err := n.signaling.Signal(ctx, &Signal{
@@ -756,7 +929,12 @@ func (n *listenerNegotiator) startTransports(ctx context.Context, conn *Conn, d 
 	conn.observeTransport(TransportLayerSCTP, TransportState(conn.sctp.State().String()))
 	conn.maxSegmentPayload.Store(conn.sctp.GetCapabilities().MaxMessageSize - 1)
 
-	return n.waitForChannelsReady(ctx, conn, channelsReady)
+	if err := n.waitForChannelsReady(ctx, conn, channelsReady); err != nil {
+		return err
+	}
+	conn.emitTransportSnapshotAsync()
+	conn.emitConnectionReady()
+	return nil
 }
 
 // waitForChannelsReady blocks until all data channels have been opened by the

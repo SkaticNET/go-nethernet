@@ -46,10 +46,20 @@ type Conn struct {
 	dtls     *webrtc.DTLSTransport
 	sctp     *webrtc.SCTPTransport
 	gatherer *webrtc.ICEGatherer
+	// sctpInit is copied once before SCTP StartContext can access Pion's
+	// unsynchronized localSctpInit field. Snapshot workers only read this copy.
+	sctpInit []byte
 
 	// description is the local session description for the Conn.
 	// newConn builds it from the local parameters of each underlying transport.
 	description *description
+
+	localDescription       string
+	remoteDescription      string
+	remoteICEParameters    webrtc.ICEParameters
+	remoteDTLSParameters   webrtc.DTLSParameters
+	remoteSCTPCapabilities webrtc.SCTPCapabilities
+	hasRemoteDescription   bool
 
 	// publicKey is the public key which identifies the remote entity behind this Conn.
 	publicKey *ecdsa.PublicKey
@@ -78,8 +88,28 @@ type Conn struct {
 	// NetherNet fragment header.
 	maxSegmentPayload atomic.Uint32
 
-	observeTransportState  func(*Conn, TransportLayer, TransportState)
-	observeDataChannelOpen func(*Conn, MessageReliability)
+	observeTransportState     func(*Conn, TransportLayer, TransportState)
+	observeDataChannelOpen    func(*Conn, MessageReliability)
+	observeDataChannelMessage func(DataChannelMessageObservation)
+	observeTransportSnapshot  func(TransportSnapshotObservation)
+	observeConnectionState    func(ConnectionStateObservation)
+
+	// Lifecycle callbacks are queued in transition order and limited to at most
+	// one ready and one closed event per Conn.
+	lifecycleMu     sync.Mutex
+	lifecycleState  connectionLifecycleState
+	lifecycleEvents chan ConnectionStateObservation
+	lifecycleDone   chan struct{}
+
+	// Snapshot requests have one active callback and at most one pending sample.
+	// Repeated changes are coalesced and counted for the next delivered event.
+	snapshotMu                sync.Mutex
+	snapshotWake              chan struct{}
+	snapshotPending           bool
+	snapshotCallbackActive    bool
+	snapshotPendingClose      *TransportSnapshotObservation
+	snapshotClosing           bool
+	droppedTransportSnapshots atomic.Uint64
 
 	readMu  sync.Mutex
 	readBuf []byte
@@ -222,8 +252,29 @@ func (conn *Conn) Send(data []byte, reliability MessageReliability) (n int, err 
 		remaining := totalSegments - 1
 		for i := 0; i < len(data); i += segmentSize {
 			frag := data[i:min(len(data), i+segmentSize)]
-			if err := d.Send(append([]byte{uint8(remaining)}, frag...)); err != nil {
-				return n, fmt.Errorf("write segment #%d: %w", totalSegments-1-remaining, closedWriteError(err))
+			wire := make([]byte, len(frag)+1)
+			wire[0] = uint8(remaining)
+			copy(wire[1:], frag)
+			var event DataChannelMessageObservation
+			observing := conn.observeDataChannelMessage != nil
+			if observing {
+				event = d.observation(DataChannelMessageOutbound, false)
+				event.SegmentIndex = totalSegments - 1 - remaining
+				event.SegmentCount = totalSegments
+				event.ParseOutcome = MessageParseValid
+				event.ReassemblyOutcome = MessageReassemblyNotApplicable
+				// observeMessage makes the single callback-owned copy after Send.
+				event.Data = wire
+			}
+			if sendErr := d.Send(wire); sendErr != nil {
+				if observing {
+					event.Err = sendErr
+					d.observeMessage(event)
+				}
+				return n, fmt.Errorf("write segment #%d: %w", totalSegments-1-remaining, closedWriteError(sendErr))
+			}
+			if observing {
+				d.observeMessage(event)
 			}
 			n += len(frag)
 			remaining--
@@ -312,9 +363,19 @@ func (conn *Conn) remoteAddr() *Addr {
 // of the Conn. It also cancels the background context with the provided cause so that may be returned
 // by current-blocking methods such as [Conn.Read].
 func (conn *Conn) close(cause error) (err error) {
+	closed := false
 	conn.once.Do(func() {
+		closed = true
+		conn.beginConnectionClose()
 		if cause != nil {
-			conn.log.Debug("connection is closing with a cause", slog.Any("cause", cause))
+			// The optional lifecycle observer receives the cause. Do not add it to
+			// library logs, where transport details could be retained unexpectedly.
+			conn.log.Debug("connection is closing with a cause")
+		}
+		if conn.observeTransportSnapshot != nil {
+			snapshot := conn.transportSnapshotObservation()
+			snapshot.Snapshot.Phase = TransportSnapshotPhasePreClose
+			conn.queuePreCloseTransportSnapshot(snapshot)
 		}
 		conn.cancel(cause)
 		conn.negotiator.handleClose(conn)
@@ -333,6 +394,9 @@ func (conn *Conn) close(cause error) (err error) {
 			conn.gatherer.Close(),
 		)
 	})
+	if closed {
+		conn.emitConnectionClosed(cause)
+	}
 	return err
 }
 
@@ -381,6 +445,7 @@ func isTerminalICEState(state webrtc.ICETransportState) bool {
 func (conn *Conn) handleTransports() {
 	conn.ice.OnConnectionStateChange(func(state webrtc.ICETransportState) {
 		conn.observeTransport(TransportLayerICE, TransportState(state.String()))
+		conn.emitTransportSnapshotAsync()
 		if isTerminalICEState(state) {
 			// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
 			go conn.close(fmt.Errorf("nethernet: ICE transport entered unrecoverable state: %s", state))
@@ -388,6 +453,7 @@ func (conn *Conn) handleTransports() {
 	})
 	conn.dtls.OnStateChange(func(state webrtc.DTLSTransportState) {
 		conn.observeTransport(TransportLayerDTLS, TransportState(state.String()))
+		conn.emitTransportSnapshotAsync()
 		switch state {
 		case webrtc.DTLSTransportStateClosed, webrtc.DTLSTransportStateFailed:
 			// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
@@ -397,6 +463,7 @@ func (conn *Conn) handleTransports() {
 	})
 	conn.sctp.OnClose(func(err error) {
 		conn.observeTransport(TransportLayerSCTP, TransportState(conn.sctp.State().String()))
+		conn.emitTransportSnapshotAsync()
 		var e error
 		if err != nil {
 			e = fmt.Errorf("nethernet: SCTP transport closed: %w", err)
@@ -406,12 +473,243 @@ func (conn *Conn) handleTransports() {
 		// This handler function itself is invoked while holding an internal lock, so call close in a goroutine to avoid deadlock.
 		go conn.close(e)
 	})
+	conn.ice.OnSelectedCandidatePairChange(func(*webrtc.ICECandidatePair) {
+		conn.emitTransportSnapshotAsync()
+	})
 }
 
 func (conn *Conn) observeTransport(layer TransportLayer, state TransportState) {
 	if observe := conn.observeTransportState; observe != nil {
 		observe(conn, layer, state)
 	}
+}
+
+func (conn *Conn) emitTransportSnapshotAsync() {
+	if conn.observeTransportSnapshot == nil {
+		return
+	}
+	conn.snapshotMu.Lock()
+	defer conn.snapshotMu.Unlock()
+	if conn.snapshotClosing {
+		return
+	}
+	if conn.snapshotPending {
+		conn.droppedTransportSnapshots.Add(1)
+		return
+	}
+	conn.snapshotPending = true
+	select {
+	case conn.snapshotWake <- struct{}{}:
+	default:
+		// The wake is full only when another request is pending. Keep the
+		// existing sample represented and account for the coalesced update.
+		conn.droppedTransportSnapshots.Add(1)
+	}
+}
+
+func (conn *Conn) queuePreCloseTransportSnapshot(snapshot TransportSnapshotObservation) {
+	conn.snapshotMu.Lock()
+	defer conn.snapshotMu.Unlock()
+	conn.snapshotClosing = true
+	if conn.snapshotPending {
+		conn.droppedTransportSnapshots.Add(1)
+	}
+	conn.snapshotPending = true
+	conn.snapshotPendingClose = &snapshot
+	select {
+	case conn.snapshotWake <- struct{}{}:
+	default:
+		// The worker will read the replacement close sample for the queued wake.
+	}
+}
+
+func (conn *Conn) startSnapshotObserver(observe func(TransportSnapshotObservation)) {
+	conn.observeTransportSnapshot = observe
+	if observe == nil {
+		return
+	}
+	conn.snapshotWake = make(chan struct{}, 1)
+	go func() {
+		for range conn.snapshotWake {
+			conn.snapshotMu.Lock()
+			if !conn.snapshotPending {
+				conn.snapshotMu.Unlock()
+				continue
+			}
+			conn.snapshotPending = false
+			conn.snapshotCallbackActive = true
+			closeSnapshot := conn.snapshotPendingClose
+			conn.snapshotPendingClose = nil
+			conn.snapshotMu.Unlock()
+
+			var event TransportSnapshotObservation
+			if closeSnapshot != nil {
+				event = *closeSnapshot
+			} else {
+				event = conn.transportSnapshotObservation()
+			}
+			event.Snapshot.DroppedSnapshotEvents = conn.droppedTransportSnapshots.Load()
+			observe(event)
+			conn.snapshotMu.Lock()
+			conn.snapshotCallbackActive = false
+			conn.snapshotMu.Unlock()
+			if event.Snapshot.Phase == TransportSnapshotPhasePreClose {
+				return
+			}
+		}
+	}()
+}
+
+type connectionLifecycleState uint8
+
+const (
+	connectionLifecyclePending connectionLifecycleState = iota
+	connectionLifecycleReady
+	connectionLifecycleClosing
+	connectionLifecycleClosed
+)
+
+func (conn *Conn) startLifecycleObserver(observe func(ConnectionStateObservation)) {
+	conn.observeConnectionState = observe
+	if observe == nil {
+		return
+	}
+	conn.lifecycleEvents = make(chan ConnectionStateObservation, 2)
+	conn.lifecycleDone = make(chan struct{})
+	go func() {
+		defer close(conn.lifecycleDone)
+		for event := range conn.lifecycleEvents {
+			observe(event)
+			if event.State == ConnectionStateClosed {
+				return
+			}
+		}
+	}()
+}
+
+func (conn *Conn) emitConnectionReady() {
+	conn.lifecycleMu.Lock()
+	defer conn.lifecycleMu.Unlock()
+	if conn.lifecycleState != connectionLifecyclePending {
+		return
+	}
+	conn.lifecycleState = connectionLifecycleReady
+	if conn.observeConnectionState != nil {
+		conn.lifecycleEvents <- ConnectionStateObservation{ConnectionID: conn.id, State: ConnectionStateReady}
+	}
+}
+
+// beginConnectionClose makes the lifecycle terminal before transport teardown
+// starts, so startup cannot report Ready while Close is in progress.
+func (conn *Conn) beginConnectionClose() {
+	conn.lifecycleMu.Lock()
+	defer conn.lifecycleMu.Unlock()
+	if conn.lifecycleState != connectionLifecycleClosed {
+		conn.lifecycleState = connectionLifecycleClosing
+	}
+}
+
+func (conn *Conn) emitConnectionClosed(cause error) {
+	conn.lifecycleMu.Lock()
+	defer conn.lifecycleMu.Unlock()
+	if conn.lifecycleState == connectionLifecycleClosed {
+		return
+	}
+	conn.lifecycleState = connectionLifecycleClosed
+	if conn.observeConnectionState != nil {
+		conn.lifecycleEvents <- ConnectionStateObservation{
+			ConnectionID:          conn.id,
+			State:                 ConnectionStateClosed,
+			Err:                   cause,
+			DroppedSnapshotEvents: conn.droppedTransportSnapshots.Load(),
+		}
+	}
+}
+
+func (conn *Conn) transportSnapshotObservation() TransportSnapshotObservation {
+	iceState := conn.ice.State()
+	snapshot := TransportSnapshotObservation{
+		ConnectionID: conn.id,
+		Snapshot: TransportSnapshot{
+			Phase:                TransportSnapshotPhaseCurrent,
+			LocalDescription:     conn.localDescription,
+			HasLocalDescription:  conn.localDescription != "",
+			RemoteDescription:    conn.remoteDescription,
+			HasRemoteDescription: conn.hasRemoteDescription,
+			ICEState:             TransportState(iceState.String()),
+			ICEGathererState:     TransportState(conn.gatherer.State().String()),
+			ICERole:              conn.ice.Role().String(),
+			ICEStats:             conn.ice.Stats(),
+			DTLSState:            TransportState(conn.dtls.State().String()),
+			SCTPState:            TransportState(conn.sctp.State().String()),
+			SCTPInit:             slices.Clone(conn.sctpInit),
+			SCTPMaxChannels:      conn.sctp.MaxChannels(),
+			SCTPBufferedAmount:   conn.sctp.BufferedAmount(),
+		},
+	}
+	s := &snapshot.Snapshot
+	if conn.description != nil {
+		s.LocalICEParameters = conn.description.ice
+		s.HasLocalICEParameters = true
+		s.LocalDTLSParameters = cloneDTLSParameters(conn.description.dtls)
+		s.HasLocalDTLSParameters = true
+	}
+	if conn.hasRemoteDescription {
+		s.RemoteDescription = conn.remoteDescription
+		s.HasRemoteDescription = true
+		s.RemoteICEParameters = conn.remoteICEParameters
+		s.HasRemoteICEParameters = true
+		s.RemoteDTLSParameters = cloneDTLSParameters(conn.remoteDTLSParameters)
+		s.HasRemoteDTLSParameters = true
+		s.RemoteSCTPCapabilities = conn.remoteSCTPCapabilities
+		s.HasRemoteSCTPCapabilities = true
+	}
+	if localParameters, err := conn.ice.GetLocalParameters(); err == nil {
+		s.LocalICEParameters = localParameters
+		s.HasLocalICEParameters = true
+	}
+	if remoteParameters, err := conn.ice.GetRemoteParameters(); err == nil {
+		s.RemoteICEParameters = remoteParameters
+		s.HasRemoteICEParameters = true
+	}
+	if localCandidates, err := conn.gatherer.GetLocalCandidates(); err == nil {
+		s.LocalCandidates = slices.Clone(localCandidates)
+		s.HasLocalCandidates = true
+	}
+	conn.candidatesMu.Lock()
+	s.RemoteCandidates = slices.Clone(conn.candidates)
+	conn.candidatesMu.Unlock()
+	s.HasRemoteCandidates = conn.hasRemoteDescription
+	if pair, _ := conn.ice.GetSelectedCandidatePair(); pair != nil {
+		pairCopy := *pair
+		if pair.Local != nil {
+			local := *pair.Local
+			pairCopy.Local = &local
+		}
+		if pair.Remote != nil {
+			remote := *pair.Remote
+			pairCopy.Remote = &remote
+		}
+		s.SelectedCandidatePair = &pairCopy
+	}
+	if conn.ctx != nil && conn.ctx.Err() == nil && iceState == webrtc.ICETransportStateConnected {
+		s.SelectedCandidatePairStats, s.HasSelectedCandidatePairStats = conn.ice.GetSelectedCandidatePairStats()
+	}
+	s.RemoteCertificate = slices.Clone(conn.dtls.GetRemoteCertificate())
+	s.LocalSCTPCapabilities = conn.sctp.GetCapabilities()
+	s.HasLocalSCTPCapabilities = true
+	s.SCTPStats = conn.sctp.Stats()
+	if s.SCTPStats.Metadata != nil {
+		metadata := *s.SCTPStats.Metadata
+		s.SCTPStats.Metadata = &metadata
+	}
+	s.SCTPMetadata, s.HasSCTPMetadata = conn.sctp.Metadata()
+	return snapshot
+}
+
+func cloneDTLSParameters(parameters webrtc.DTLSParameters) webrtc.DTLSParameters {
+	parameters.Fingerprints = slices.Clone(parameters.Fingerprints)
+	return parameters
 }
 
 // handleSignal handles an incoming Signal signaled from the remote connection.
@@ -969,6 +1267,7 @@ func newConn(api *webrtc.API, gathererOpts webrtc.ICEGatherOptions, id uint64, n
 		id:             id,
 		networkID:      networkID,
 		localNetworkID: localNetworkID,
+		sctpInit:       slices.Clone(sctpTransport.GetSctpInit()),
 	}
 	c.ctx, c.cancel = context.WithCancelCause(context.Background())
 	c.maxSegmentPayload.Store(maxMessageSize)

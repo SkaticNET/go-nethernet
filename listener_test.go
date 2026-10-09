@@ -896,8 +896,15 @@ func (s listenerResponseSignaling) Signal(ctx context.Context, signal *Signal) e
 
 // dialAcceptedListener establishes a real WebRTC connection and owns its cleanup.
 func dialAcceptedListener(t *testing.T, client, server Signaling) (*Listener, *Conn, *Conn) {
+	return dialAcceptedListenerWithConfig(t, client, server, ListenConfig{AllowAnonymous: true})
+}
+
+func dialAcceptedListenerWithConfig(t *testing.T, client, server Signaling, conf ListenConfig) (*Listener, *Conn, *Conn) {
 	t.Helper()
-	l, err := (ListenConfig{AllowAnonymous: true}).Listen(server)
+	if conf.Log == nil {
+		conf.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	l, err := conf.Listen(server)
 	if err != nil {
 		t.Fatalf("Listen() error = %v", err)
 	}
