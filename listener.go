@@ -209,6 +209,7 @@ const (
 // Err contains a parse, reassembly, or send error. ConnectionID matches the signaled NetherNet connection.
 type DataChannelMessageObservation struct {
 	ConnectionID      uint64
+	NetworkID         string
 	Direction         DataChannelMessageDirection
 	StreamID          uint16
 	HasStreamID       bool
@@ -241,6 +242,7 @@ const (
 // ConnectionStateObservation correlates a ready or closed Conn with its signaling connection ID.
 type ConnectionStateObservation struct {
 	ConnectionID uint64
+	NetworkID    string
 	State        ConnectionState
 	Err          error
 	// DroppedSnapshotEvents is the cumulative number of coalesced or omitted snapshots for this Conn.
@@ -250,6 +252,7 @@ type ConnectionStateObservation struct {
 // TransportSnapshotObservation correlates a TransportSnapshot with its signaling connection ID.
 type TransportSnapshotObservation struct {
 	ConnectionID uint64
+	NetworkID    string
 	Snapshot     TransportSnapshot
 }
 

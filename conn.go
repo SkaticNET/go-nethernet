@@ -595,7 +595,7 @@ func (conn *Conn) emitConnectionReady() {
 	}
 	conn.lifecycleState = connectionLifecycleReady
 	if conn.observeConnectionState != nil {
-		conn.lifecycleEvents <- ConnectionStateObservation{ConnectionID: conn.id, State: ConnectionStateReady}
+		conn.lifecycleEvents <- ConnectionStateObservation{ConnectionID: conn.id, NetworkID: conn.networkID, State: ConnectionStateReady}
 	}
 }
 
@@ -619,6 +619,7 @@ func (conn *Conn) emitConnectionClosed(cause error) {
 	if conn.observeConnectionState != nil {
 		conn.lifecycleEvents <- ConnectionStateObservation{
 			ConnectionID:          conn.id,
+			NetworkID:             conn.networkID,
 			State:                 ConnectionStateClosed,
 			Err:                   cause,
 			DroppedSnapshotEvents: conn.droppedTransportSnapshots.Load(),
@@ -630,6 +631,7 @@ func (conn *Conn) transportSnapshotObservation() TransportSnapshotObservation {
 	iceState := conn.ice.State()
 	snapshot := TransportSnapshotObservation{
 		ConnectionID: conn.id,
+		NetworkID:    conn.networkID,
 		Snapshot: TransportSnapshot{
 			Phase:                TransportSnapshotPhaseCurrent,
 			LocalDescription:     conn.localDescription,

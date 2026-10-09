@@ -89,7 +89,7 @@ func TestListenerObservesIncomingAndOutgoingDataChannelSegments(t *testing.T) {
 		for index := range 2 {
 			select {
 			case event := <-events:
-				if event.ConnectionID != serverConn.id || event.Direction != wantDirection {
+				if event.ConnectionID != serverConn.id || event.NetworkID != serverConn.networkID || event.Direction != wantDirection {
 					t.Fatalf("event identity = (%d, %q), want (%d, %q)", event.ConnectionID, event.Direction, serverConn.id, wantDirection)
 				}
 				if event.Reliability != MessageReliabilityReliable || !event.Ordered || !event.HasStreamID {
@@ -144,7 +144,7 @@ func TestListenerObservesLifecycleAndOwnedTransportSnapshots(t *testing.T) {
 
 	select {
 	case event := <-states:
-		if event.ConnectionID != serverConn.id || event.State != ConnectionStateReady || event.Err != nil {
+		if event.ConnectionID != serverConn.id || event.NetworkID != serverConn.networkID || event.State != ConnectionStateReady || event.Err != nil {
 			t.Fatal("listener did not report the correlated ready state")
 		}
 	case <-time.After(5 * time.Second):
@@ -157,7 +157,7 @@ forSnapshots:
 	for {
 		select {
 		case event := <-snapshots:
-			if event.ConnectionID == serverConn.id && event.Snapshot.HasLocalDescription && event.Snapshot.HasRemoteDescription && len(event.Snapshot.LocalCandidates) > 0 && len(event.Snapshot.RemoteCandidates) > 0 && event.Snapshot.SelectedCandidatePair != nil && len(event.Snapshot.RemoteCertificate) > 0 && len(event.Snapshot.SCTPInit) > 0 {
+			if event.ConnectionID == serverConn.id && event.NetworkID == serverConn.networkID && event.Snapshot.HasLocalDescription && event.Snapshot.HasRemoteDescription && len(event.Snapshot.LocalCandidates) > 0 && len(event.Snapshot.RemoteCandidates) > 0 && event.Snapshot.SelectedCandidatePair != nil && len(event.Snapshot.RemoteCertificate) > 0 && len(event.Snapshot.SCTPInit) > 0 {
 				observed = event.Snapshot
 				break forSnapshots
 			}
@@ -219,7 +219,7 @@ forSnapshots:
 	}
 	select {
 	case event := <-states:
-		if event.ConnectionID != serverConn.id || event.State != ConnectionStateClosed {
+		if event.ConnectionID != serverConn.id || event.NetworkID != serverConn.networkID || event.State != ConnectionStateClosed {
 			t.Fatal("listener did not report the correlated closed state")
 		}
 	case <-time.After(5 * time.Second):

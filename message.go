@@ -285,6 +285,7 @@ func (c *dataChannel) observation(direction DataChannelMessageDirection, isStrin
 	}
 	if c.conn != nil {
 		event.ConnectionID = c.conn.id
+		event.NetworkID = c.conn.networkID
 	}
 	if c.DataChannel != nil {
 		event.Label = c.Label()
