@@ -185,6 +185,12 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 	if err != nil {
 		return nil, fmt.Errorf("create conn: %w", err)
 	}
+	if capture := captureFromContext(ctx); capture != nil {
+		c.capture = capture
+		c.capturePeer = "upstream"
+		c.releaseCapture = capture.Retain()
+		capture.SetFailureHandler(func(err error) { go c.close(err) })
+	}
 	defer func() {
 		if err != nil {
 			_ = c.close(fmt.Errorf("dial failure: %w", err))
@@ -216,11 +222,17 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 	if err != nil {
 		return nil, fmt.Errorf("encode offer: %w", err)
 	}
+	if capture := captureFromContext(ctx); capture != nil {
+		if err := capture.Emit(CaptureEvent{Kind: "ice-sdp", Peer: "upstream", Direction: captureDirection("upstream", false), Data: offer, Bytes: len(offer), Outcome: "sent"}); err != nil {
+			return nil, err
+		}
+	}
 	if err := signaling.Signal(ctx, &Signal{
 		Type:         SignalTypeOffer,
 		Data:         string(offer),
 		ConnectionID: d.ConnectionID,
 		NetworkID:    networkID,
+		Capture:      captureFromContext(ctx),
 	}); err != nil {
 		return nil, fmt.Errorf("signal offer: %w", err)
 	}
@@ -248,6 +260,11 @@ func (d Dialer) DialContext(ctx context.Context, networkID string, signaling Sig
 			}
 			switch signal.Type {
 			case SignalTypeAnswer:
+				if c.capture != nil {
+					if err := c.capture.Emit(CaptureEvent{Kind: "ice-sdp", Peer: "upstream", Direction: captureDirection("upstream", true), Data: []byte(signal.Data), Bytes: len(signal.Data), Outcome: "received"}); err != nil {
+						return nil, err
+					}
+				}
 				s := &sdp.SessionDescription{}
 				if err := s.UnmarshalString(signal.Data); err != nil {
 					d.signalError(signaling, networkID, ErrorCodeFailedToSetRemoteDescription)

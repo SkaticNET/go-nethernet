@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,6 +46,9 @@ type HandlerConfig struct {
 	// data provided by the upstream game protocol. When set to true, [Handler.PongData]
 	// becomes no-op.
 	DisablePongData bool
+
+	// CaptureRequest creates an opt-in session capture before request parsing.
+	CaptureRequest func(*http.Request) (*nethernet.Capture, error)
 }
 
 // New returns a new [Handler] from the configuration.
@@ -450,6 +454,7 @@ func (h *Handler) negotiate(ctx context.Context, networkID, offer string) (*neth
 		ConnectionID: rand.Uint64(),
 		Data:         offer,
 		NetworkID:    networkID,
+		Capture:      nethernet.CaptureFromContext(ctx),
 	}
 	key := connectionKey{networkID: signal.NetworkID, connectionID: signal.ConnectionID}
 
@@ -489,7 +494,172 @@ var errOfferNotAdmitted = errors.New("nethernet/endpoint: offer not admitted")
 // ServeHTTP implements [http.Handler] by delegating the given response writer
 // and the request to the internal [http.ServeMux].
 func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if h.conf.CaptureRequest != nil {
+		capture, err := h.conf.CaptureRequest(req)
+		if err != nil {
+			writeText(w, http.StatusInternalServerError, "Capture initialization failed")
+			return
+		}
+		if capture != nil {
+			releaseRequest := capture.Retain()
+			defer releaseRequest()
+			captureCtx, cancelCapture := context.WithCancel(req.Context())
+			defer cancelCapture()
+			capture.SetFailureHandler(func(error) { cancelCapture() })
+			ctx := nethernet.WithCapture(captureCtx, capture)
+			req = req.WithContext(ctx)
+			if req.Body != nil {
+				req.Body = captureBody{ReadCloser: req.Body, capture: capture, direction: "inbound"}
+			}
+			responseWriter := &captureResponseWriter{ResponseWriter: w, capture: capture, request: req, cancel: cancelCapture}
+			w = responseWriter
+			direction := "client-to-relay"
+			defer func() {
+				exchangeOutcome := "completed"
+				responseOutcome := "complete"
+				if responseWriter.captureErr != nil {
+					exchangeOutcome = "capture-failed"
+					responseOutcome = "aborted"
+				}
+				if err := capture.Emit(nethernet.CaptureEvent{Kind: "http-exchange", Peer: "downstream", Direction: direction, Method: req.Method, URL: req.URL.String(), Host: req.Host, Protocol: req.Proto, ContentLength: req.ContentLength, Trailers: req.Trailer.Clone(), RemoteHTTPAddr: req.RemoteAddr, Outcome: exchangeOutcome}); err != nil {
+					responseWriter.captureFailure(err)
+				}
+				if err := capture.Emit(nethernet.CaptureEvent{Kind: "http-response-complete", Peer: "downstream", Direction: "relay-to-client", Method: req.Method, URL: req.URL.String(), Host: req.Host, Protocol: req.Proto, ContentLength: responseWriter.responseContentLength(), StatusCode: responseWriter.status, Headers: responseWriter.Header().Clone(), Trailers: responseTrailers(responseWriter.Header()), Outcome: responseOutcome}); err != nil {
+					responseWriter.captureFailure(err)
+				}
+			}()
+			if err := capture.Emit(nethernet.CaptureEvent{Kind: "http-request", Peer: "downstream", Direction: direction, Method: req.Method, URL: req.URL.String(), Headers: req.Header.Clone(), Host: req.Host, Protocol: req.Proto, ContentLength: req.ContentLength, Trailers: req.Trailer.Clone(), RemoteHTTPAddr: req.RemoteAddr, Outcome: "started"}); err != nil {
+				responseWriter.abortCapture(err)
+				return
+			}
+		}
+	}
 	h.mux.ServeHTTP(w, req)
+}
+
+func responseTrailers(header http.Header) http.Header {
+	trailers := make(http.Header)
+	for _, declaration := range header.Values("Trailer") {
+		for _, name := range strings.Split(declaration, ",") {
+			name = http.CanonicalHeaderKey(strings.TrimSpace(name))
+			if name == "" {
+				continue
+			}
+			if values := header.Values(name); len(values) != 0 {
+				trailers[name] = append([]string(nil), values...)
+			}
+		}
+	}
+	prefix := strings.ToLower(http.TrailerPrefix)
+	for name, values := range header {
+		if strings.HasPrefix(strings.ToLower(name), prefix) {
+			trailerName := http.CanonicalHeaderKey(name[len(http.TrailerPrefix):])
+			if trailerName != "" {
+				trailers[trailerName] = append([]string(nil), values...)
+			}
+		}
+	}
+	return trailers
+}
+
+type captureBody struct {
+	io.ReadCloser
+	capture   *nethernet.Capture
+	direction string
+}
+
+func (b captureBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	eventErr := b.capture.Emit(nethernet.CaptureEvent{Kind: "http-body", Peer: "downstream", Direction: "client-to-relay", Data: p[:n], Bytes: n, Outcome: ioOutcome(err), Err: errorText(err)})
+	if err == nil {
+		err = eventErr
+	}
+	return n, err
+}
+
+type captureResponseWriter struct {
+	http.ResponseWriter
+	capture     *nethernet.Capture
+	request     *http.Request
+	status      int
+	wroteHeader bool
+	cancel      context.CancelFunc
+	captureErr  error
+}
+
+func (w *captureResponseWriter) captureFailure(err error) {
+	if err == nil || w.captureErr != nil {
+		return
+	}
+	w.captureErr = err
+	if w.cancel != nil {
+		w.cancel()
+	}
+}
+
+func (w *captureResponseWriter) abortCapture(err error) {
+	w.captureFailure(err)
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	w.status = http.StatusInternalServerError
+	w.Header().Del("Content-Length")
+	w.Header().Del("Content-Type")
+	w.ResponseWriter.WriteHeader(http.StatusInternalServerError)
+}
+
+func (w *captureResponseWriter) WriteHeader(status int) {
+	if !w.wroteHeader {
+		var request *http.Request = w.request
+		if err := w.capture.Emit(nethernet.CaptureEvent{Kind: "http-response", Peer: "downstream", Direction: "relay-to-client", Method: request.Method, URL: request.URL.String(), Host: request.Host, Protocol: request.Proto, ContentLength: request.ContentLength, RemoteHTTPAddr: request.RemoteAddr, StatusCode: status, Headers: w.Header().Clone(), Outcome: "headers"}); err != nil {
+			w.abortCapture(err)
+			return
+		}
+		w.wroteHeader = true
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+func (w *captureResponseWriter) responseContentLength() int64 {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	length, _ := strconv.ParseInt(w.Header().Get("Content-Length"), 10, 64)
+	return length
+}
+
+func (w *captureResponseWriter) Write(p []byte) (int, error) {
+	if w.captureErr != nil {
+		return 0, w.captureErr
+	}
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+		if w.captureErr != nil {
+			return 0, w.captureErr
+		}
+	}
+	n, err := w.ResponseWriter.Write(p)
+	eventErr := w.capture.Emit(nethernet.CaptureEvent{Kind: "http-body", Peer: "downstream", Direction: "relay-to-client", Data: p[:n], Bytes: n, Outcome: ioOutcome(err), Err: errorText(err)})
+	if eventErr != nil {
+		w.captureFailure(eventErr)
+	}
+	if err == nil {
+		err = eventErr
+	}
+	return n, err
+}
+func ioOutcome(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	return "error"
+}
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // connectionKey uniquely identifies a single in-progress negotiation.

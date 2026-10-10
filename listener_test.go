@@ -15,6 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pion/ice/v4"
+	"github.com/pion/transport/v5"
+	"github.com/pion/transport/v5/stdnet"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -1013,4 +1016,169 @@ func TestListenerRemoteErrorDoesNotWaitForTransportCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitListenerState(t, l, 0, 0)
+}
+
+type loopbackOnlyTransportNet struct{ transport.Net }
+
+func (n loopbackOnlyTransportNet) ListenUDP(network string, local *net.UDPAddr) (transport.UDPConn, error) {
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
+	if local != nil {
+		addr.Port = local.Port
+	}
+	return n.Net.ListenUDP("udp4", addr)
+}
+
+func (n loopbackOnlyTransportNet) ListenPacket(_ string, address string) (net.PacketConn, error) {
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	return n.Net.ListenPacket("udp4", net.JoinHostPort("127.0.0.1", port))
+}
+
+func (n loopbackOnlyTransportNet) DialUDP(network string, local, remote *net.UDPAddr) (transport.UDPConn, error) {
+	if remote == nil || !remote.IP.IsLoopback() {
+		return nil, errors.New("controlled capture test only permits loopback UDP")
+	}
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
+	if local != nil {
+		addr.Port = local.Port
+	}
+	return n.Net.DialUDP(network, addr, remote)
+}
+
+func newLoopbackCaptureTestAPI(capture *Capture, peer string) (*webrtc.API, error) {
+	var setting webrtc.SettingEngine
+	setting.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+	setting.SetIncludeLoopbackCandidate(true)
+	setting.SetIPFilter(func(ip net.IP) bool { return ip.IsLoopback() })
+	setting.SetSTUNGatherTimeout(250 * time.Millisecond)
+	setting.SetICETimeouts(4*time.Second, 8*time.Second, 200*time.Millisecond)
+	if err := setting.SetEphemeralUDPPortRange(50000, 60000); err != nil {
+		return nil, err
+	}
+	if err := ConfigureCaptureSettingsForPeer(capture, &setting, peer); err != nil {
+		return nil, err
+	}
+	base, err := stdnet.NewNet()
+	if err != nil {
+		return nil, err
+	}
+	setting.SetNet(captureNet{Net: loopbackOnlyTransportNet{Net: base}, capture: capture, peer: peer})
+	return webrtc.NewAPI(webrtc.WithSettingEngine(setting)), nil
+}
+
+func TestCaptureDialerAndListenerRecordBothReliabilityClassesAndDirections(t *testing.T) {
+	clientSignaling, serverSignaling := newMemorySignalingPair("client", "server")
+	var mu sync.Mutex
+	var events []CaptureEvent
+	done := make(chan struct{})
+	capture := &Capture{Done: func() { close(done) }, Event: func(event CaptureEvent) error {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		return nil
+	}}
+	apiForSignal := func(signal *Signal) (*webrtc.API, error) {
+		return newLoopbackCaptureTestAPI(signal.Capture, "downstream")
+	}
+	listener, err := (ListenConfig{APIForSignal: apiForSignal, AllowAnonymous: true, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}).Listen(serverSignaling)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	ctx, cancel := context.WithTimeout(WithCapture(t.Context(), capture), 10*time.Second)
+	defer cancel()
+	accepted := make(chan net.Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- conn
+	}()
+	api, err := newLoopbackCaptureTestAPI(capture, "upstream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConn, err := (Dialer{API: api, AllowIdentitylessServer: true, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}).DialContext(ctx, serverSignaling.NetworkID(), clientSignaling)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConn.Close()
+	var serverConn *Conn
+	select {
+	case raw := <-accepted:
+		serverConn = raw.(*Conn)
+	case err := <-acceptErr:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	defer serverConn.Close()
+	clientConn.maxSegmentPayload.Store(2)
+	serverConn.maxSegmentPayload.Store(2)
+	for _, reliability := range []MessageReliability{MessageReliabilityReliable, MessageReliabilityUnreliable} {
+		payload := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
+		if reliability == MessageReliabilityUnreliable {
+			payload = []byte{0xaa, 0xbb}
+		}
+		for _, pair := range [][2]*Conn{{clientConn, serverConn}, {serverConn, clientConn}} {
+			if n, err := pair[0].Send(payload, reliability); err != nil || n != len(payload) {
+				t.Fatalf("Send(%d) = %d, %v", reliability, n, err)
+			}
+			got, err := pair[1].Receive(reliability)
+			if err != nil || !bytes.Equal(got, payload) {
+				t.Fatalf("Receive(%d) = %x, %v", reliability, got, err)
+			}
+		}
+	}
+	mu.Lock()
+	seen := map[string]bool{}
+	maxReliableSegments := 0
+	for _, event := range events {
+		if event.Kind != "data-channel-segment" {
+			continue
+		}
+		seen[event.Peer+":"+event.Direction+":"+fmt.Sprint(event.Reliability)] = true
+		if event.Reliability == uint8(MessageReliabilityReliable) && event.SegmentCount > maxReliableSegments {
+			maxReliableSegments = event.SegmentCount
+		}
+	}
+	for _, role := range []string{"upstream:relay-to-server", "downstream:client-to-relay", "downstream:relay-to-client", "upstream:server-to-relay"} {
+		if !seen[role+":"+fmt.Sprint(uint8(MessageReliabilityReliable))] || !seen[role+":"+fmt.Sprint(uint8(MessageReliabilityUnreliable))] {
+			t.Fatalf("missing direction/reliability capture for %s: %v", role, seen)
+		}
+	}
+	if maxReliableSegments < 9 {
+		mu.Unlock()
+		t.Fatalf("reliable segment count = %d, want more than eight", maxReliableSegments)
+	}
+	mu.Unlock()
+	closeErrs := make(chan error, 2)
+	go func() { closeErrs <- serverConn.Close() }()
+	go func() { closeErrs <- clientConn.Close() }()
+	for range 2 {
+		if err := <-closeErrs; err != nil {
+			t.Fatalf("Conn.Close: %v", err)
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("capture references did not close after both Conns closed")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	closed := map[string]int{}
+	for _, event := range events {
+		if event.Kind == "connection-state" && event.Outcome == "closed" {
+			closed[event.Peer]++
+		}
+	}
+	if closed["downstream"] != 1 || closed["upstream"] != 1 {
+		t.Fatalf("terminal connection-state events = %v, want one per peer", closed)
+	}
 }

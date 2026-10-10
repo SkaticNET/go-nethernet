@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -120,6 +121,129 @@ func TestHandlerServesSDPAnswer(t *testing.T) {
 	}
 	if got := result.Header.Get("Content-Type"); got != "application/sdp" {
 		t.Fatalf("content type = %q, want application/sdp", got)
+	}
+}
+
+func TestHandlerCaptureKeepsOrdinaryResponseHeadersOutOfTrailers(t *testing.T) {
+	classified := responseTrailers(http.Header{
+		"Trailer":                         {"X-Declared"},
+		"X-Declared":                      {"declared-value"},
+		http.TrailerPrefix + "X-Prefixed": {"prefixed-value"},
+		"Content-Type":                    {"text/plain"},
+		"X-Ordinary":                      {"ordinary-value"},
+	})
+	if len(classified) != 2 || classified.Get("X-Declared") != "declared-value" || classified.Get("X-Prefixed") != "prefixed-value" {
+		t.Fatalf("responseTrailers() = %#v, want only declared and prefixed trailer fields", classified)
+	}
+	var events []nethernet.CaptureEvent
+	handler := (HandlerConfig{CaptureRequest: func(*http.Request) (*nethernet.Capture, error) {
+		return &nethernet.Capture{Event: func(event nethernet.CaptureEvent) error {
+			events = append(events, event)
+			return nil
+		}}, nil
+	}}).New()
+	handler.Status(Status{ServerName: "synthetic"})
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/join", nil))
+	var complete *nethernet.CaptureEvent
+	for i := range events {
+		if events[i].Kind == "http-response-complete" {
+			complete = &events[i]
+		}
+	}
+	if complete == nil {
+		t.Fatal("missing terminal response event")
+	}
+	if complete.Headers.Get("Content-Type") == "" {
+		t.Fatalf("ordinary response header missing: %#v", complete.Headers)
+	}
+	if len(complete.Trailers) != 0 {
+		t.Fatalf("ordinary response headers were mislabeled as trailers: %#v", complete.Trailers)
+	}
+}
+
+func TestHandlerAbortsSuccessfulResponseWhenHeaderCaptureFails(t *testing.T) {
+	captureErr := errors.New("controlled header capture failure")
+	var failureReported bool
+	capture := &nethernet.Capture{
+		Event: func(event nethernet.CaptureEvent) error {
+			if event.Kind == "http-response" {
+				return captureErr
+			}
+			return nil
+		},
+	}
+	capture.SetFailureHandler(func(err error) { failureReported = errors.Is(err, captureErr) })
+	handler := (HandlerConfig{CaptureRequest: func(*http.Request) (*nethernet.Capture, error) {
+		return capture, nil
+	}}).New()
+	handler.Status(Status{ServerName: "must-not-be-served"})
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/join", nil))
+	result := recorder.Result()
+	defer result.Body.Close()
+	body, err := io.ReadAll(result.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StatusCode == http.StatusOK || strings.Contains(string(body), "must-not-be-served") {
+		t.Fatalf("capture failure still served successful response: status=%d body=%q", result.StatusCode, body)
+	}
+	if !failureReported {
+		t.Fatal("capture failure handler was not called")
+	}
+}
+
+func TestHandlerAbortsRequestWhenInitialCaptureFails(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{name: "discovery GET", method: http.MethodGet, path: "/v1/join"},
+		{name: "offer POST", method: http.MethodPost, path: "/v1/join/123", body: "offer"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			captureErr := errors.New("controlled initial capture failure")
+			var failureReported bool
+			capture := &nethernet.Capture{Event: func(event nethernet.CaptureEvent) error {
+				if event.Kind == "http-request" {
+					return captureErr
+				}
+				return nil
+			}}
+			capture.SetFailureHandler(func(err error) { failureReported = errors.Is(err, captureErr) })
+			handler := (HandlerConfig{CaptureRequest: func(*http.Request) (*nethernet.Capture, error) {
+				return capture, nil
+			}}).New()
+			handler.disableNotifyTypeCheck = true
+			handler.Status(Status{ServerName: "must-not-be-served"})
+			var offers atomic.Int32
+			stop := handler.Notify(notifierFunc(func(signal *nethernet.Signal) {
+				if signal.Type == nethernet.SignalTypeOffer {
+					offers.Add(1)
+				}
+			}))
+			defer stop()
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(test.method, test.path, strings.NewReader(test.body)))
+			result := recorder.Result()
+			defer result.Body.Close()
+			response, err := io.ReadAll(result.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.StatusCode == http.StatusOK || strings.Contains(string(response), "must-not-be-served") {
+				t.Fatalf("capture failure returned successful response: status=%d body=%q", result.StatusCode, response)
+			}
+			if !failureReported {
+				t.Fatal("initial capture failure was not reported")
+			}
+			if got := offers.Load(); got != 0 {
+				t.Fatalf("offer notifications = %d, want zero", got)
+			}
+		})
 	}
 }
 

@@ -35,6 +35,9 @@ type ListenConfig struct {
 	// as it requires additional steps on the Conn (which cannot be determined by the Conn).
 	API *webrtc.API
 
+	// APIForSignal builds a per-connection API when a Signal carries a capture.
+	APIForSignal func(*Signal) (*webrtc.API, error)
+
 	// ConnContext provides a [context.Context] for starting the ICE, DTLS, and SCTP transports of the Conn. If nil,
 	// a default [context.Context] with 5 seconds timeout will be used. The parent [context.Context] may be used to
 	// create a [context.Context] to be returned (likely using [context.WithCancel] or [context.WithTimeout]).
@@ -444,7 +447,8 @@ type listenerNegotiator struct {
 
 	conn *Conn
 	// finished is guarded by mu and marks completion of the offer and any failure reply.
-	finished bool
+	finished       bool
+	releaseCapture func()
 	// closed cancels this negotiation when its connection or listener closes.
 	closed chan struct{}
 	once   sync.Once
@@ -550,6 +554,9 @@ func (n *listenerNegotiator) finish() {
 		n.unregister()
 	}
 	<-n.sem
+	if n.releaseCapture != nil {
+		n.releaseCapture()
+	}
 }
 
 // reportError sends a bounded error reply when err carries a signaling code.
@@ -613,13 +620,29 @@ func (n *listenerNegotiator) unregister() {
 // and transforms into remote description for later use in negotiation. An answer will be created from local parameters of
 // each transport and signaled back to the remote connection referenced in the offer.
 func (n *listenerNegotiator) handleOffer(signal *Signal) error {
+	if signal.Capture != nil {
+		if err := signal.Capture.Emit(CaptureEvent{Kind: "ice-sdp", Peer: "downstream", Direction: captureDirection("downstream", true), Data: []byte(signal.Data), Bytes: len(signal.Data), Outcome: "received"}); err != nil {
+			return err
+		}
+	}
 	d := &sdp.SessionDescription{}
 	if err := d.UnmarshalString(signal.Data); err != nil {
+		if signal.Capture != nil {
+			_ = signal.Capture.Emit(CaptureEvent{Kind: "ice-sdp-parse", Peer: "downstream", Direction: "local", Outcome: "error", Err: errorString(err)})
+		}
 		return wrapSignalError(fmt.Errorf("decode offer: %w", err), ErrorCodeFailedToSetRemoteDescription)
 	}
 	desc, err := parseDescription(d)
 	if err != nil {
+		if signal.Capture != nil {
+			_ = signal.Capture.Emit(CaptureEvent{Kind: "ice-sdp-parse", Peer: "downstream", Direction: "local", Outcome: "error", Err: errorString(err)})
+		}
 		return wrapSignalError(fmt.Errorf("parse offer: %w", err), ErrorCodeFailedToSetRemoteDescription)
+	}
+	if signal.Capture != nil {
+		if err := signal.Capture.Emit(CaptureEvent{Kind: "ice-sdp-parse", Peer: "downstream", Direction: "local", Outcome: "ok"}); err != nil {
+			return err
+		}
 	}
 
 	var (
@@ -643,8 +666,15 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 		return wrapSignalError(fmt.Errorf("obtain credentials: %w", err), ErrorCodeSignalingTurnAuthFailed)
 	}
 
+	api := n.conf.API
+	if signal.Capture != nil && n.conf.APIForSignal != nil {
+		api, err = n.conf.APIForSignal(signal)
+		if err != nil {
+			return err
+		}
+	}
 	c, err := newConn(
-		n.conf.API,
+		api,
 		gatherOptions(credentials, n.conf.ICEGatherPolicy),
 		signal.ConnectionID,
 		signal.NetworkID,
@@ -654,6 +684,12 @@ func (n *listenerNegotiator) handleOffer(signal *Signal) error {
 	)
 	if err != nil {
 		return fmt.Errorf("create peer connection: %w", err)
+	}
+	if signal.Capture != nil {
+		c.capture = signal.Capture
+		c.capturePeer = "downstream"
+		c.releaseCapture = signal.Capture.Retain()
+		signal.Capture.SetFailureHandler(func(err error) { go c.close(err) })
 	}
 	if n.conf.ObserveTransportSnapshot != nil {
 		// These values include raw SDP and ICE credentials, so keep them only for
@@ -1084,6 +1120,15 @@ func (l *Listener) NotifySignal(signal *Signal) bool {
 				key:      key,
 				Listener: l,
 				closed:   make(chan struct{}),
+			}
+			if signal.Capture != nil {
+				release, err := signal.Capture.TryRetain()
+				if err != nil {
+					<-l.sem
+					l.negotiationsMu.Unlock()
+					return false
+				}
+				n.releaseCapture = release
 			}
 			l.negotiations[key] = n
 			go n.negotiate(signal)

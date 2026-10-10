@@ -93,6 +93,9 @@ type Conn struct {
 	observeDataChannelMessage func(DataChannelMessageObservation)
 	observeTransportSnapshot  func(TransportSnapshotObservation)
 	observeConnectionState    func(ConnectionStateObservation)
+	capture                   *Capture
+	capturePeer               string
+	releaseCapture            func()
 
 	// Lifecycle callbacks are queued in transition order and limited to at most
 	// one ready and one closed event per Conn.
@@ -208,6 +211,9 @@ func (conn *Conn) Context() context.Context {
 	return conn.ctx
 }
 
+// Capture returns the local-only capture associated with this connection.
+func (conn *Conn) Capture() *Capture { return conn.capture }
+
 // Write writes the data into the 'ReliableDataChannel'. If the data exceeds 10000 bytes, it is split into
 // multiple segments. An error may be returned while writing a segment or if the Conn has been closed by [Conn.Close].
 func (conn *Conn) Write(b []byte) (n int, err error) {
@@ -267,11 +273,23 @@ func (conn *Conn) Send(data []byte, reliability MessageReliability) (n int, err 
 				event.Data = wire
 			}
 			if sendErr := d.Send(wire); sendErr != nil {
+				if conn.capture != nil {
+					captureErr := conn.capture.Emit(CaptureEvent{Kind: "data-channel-segment", Peer: conn.capturePeer, Direction: captureDirection(conn.capturePeer, false), Data: wire, Bytes: len(wire), Channel: d.Label(), Reliability: uint8(reliability), SegmentIndex: totalSegments - 1 - remaining, SegmentCount: totalSegments, Outcome: "error", Err: errorString(sendErr)})
+					if captureErr != nil {
+						go conn.close(captureErr)
+					}
+				}
 				if observing {
 					event.Err = sendErr
 					d.observeMessage(event)
 				}
 				return n, fmt.Errorf("write segment #%d: %w", totalSegments-1-remaining, closedWriteError(sendErr))
+			}
+			if conn.capture != nil {
+				if captureErr := conn.capture.Emit(CaptureEvent{Kind: "data-channel-segment", Peer: conn.capturePeer, Direction: captureDirection(conn.capturePeer, false), Data: wire, Bytes: len(wire), Channel: d.Label(), Reliability: uint8(reliability), SegmentIndex: totalSegments - 1 - remaining, SegmentCount: totalSegments, Outcome: "sent"}); captureErr != nil {
+					go conn.close(captureErr)
+					return n, captureErr
+				}
 			}
 			if observing {
 				d.observeMessage(event)
@@ -396,6 +414,15 @@ func (conn *Conn) close(cause error) (err error) {
 	})
 	if closed {
 		conn.emitConnectionClosed(cause)
+		if conn.capture != nil {
+			eventErr := conn.capture.Emit(CaptureEvent{Kind: "connection-state", Peer: conn.capturePeer, Direction: "local", Outcome: "closed", Err: errorString(cause)})
+			if eventErr != nil {
+				err = errors.Join(err, eventErr)
+			}
+		}
+		if conn.releaseCapture != nil {
+			conn.releaseCapture()
+		}
 	}
 	return err
 }
@@ -479,6 +506,11 @@ func (conn *Conn) handleTransports() {
 }
 
 func (conn *Conn) observeTransport(layer TransportLayer, state TransportState) {
+	if conn.capture != nil {
+		if err := conn.capture.Emit(CaptureEvent{Kind: string(layer) + "-state", Peer: conn.capturePeer, Direction: "local", Outcome: string(state)}); err != nil {
+			go conn.close(err)
+		}
+	}
 	if observe := conn.observeTransportState; observe != nil {
 		observe(conn, layer, state)
 	}

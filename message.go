@@ -97,6 +97,9 @@ func wrapDataChannel(channel *webrtc.DataChannel, reliability MessageReliability
 	}
 	ch.OnMessage(func(msg webrtc.DataChannelMessage) {
 		event, err := ch.handleMessage(msg.Data, msg.IsString)
+		if err != nil && conn.capture != nil {
+			go conn.close(err)
+		}
 		ch.observeMessage(event)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
@@ -109,7 +112,9 @@ func wrapDataChannel(channel *webrtc.DataChannel, reliability MessageReliability
 			// helps mitigate malformed or malicious input from a peer.
 			// The DataChannel invokes this callback while holding an internal lock,
 			// so the connection is closed in a goroutine to avoid deadlock.
-			go conn.close(fmt.Errorf("nethernet: handle message in %s: %w", ch.Label(), err))
+			if conn.capture == nil {
+				go conn.close(fmt.Errorf("nethernet: handle message in %s: %w", ch.Label(), err))
+			}
 		}
 	})
 	ch.OnClose(func() {
@@ -177,9 +182,9 @@ func parseMessage(b []byte) (*message, error) {
 // handleMessage handles a message received from a [webrtc.DataChannel] for the reliability. It parses
 // the incoming data into a message using parseMessage and handles the segments, and if all segments has
 // been received, it sends the buffer to either [Conn.Read] or [Conn.ReadPacket].
-func (c *dataChannel) handleMessage(b []byte, isString bool) (DataChannelMessageObservation, error) {
-	var event DataChannelMessageObservation
-	observing := c.conn != nil && c.conn.observeDataChannelMessage != nil
+func (c *dataChannel) handleMessage(b []byte, isString bool) (event DataChannelMessageObservation, err error) {
+	capturing := c.conn != nil && c.conn.capture != nil
+	observing := c.conn != nil && (c.conn.observeDataChannelMessage != nil || capturing)
 	if observing {
 		event = c.observation(DataChannelMessageInbound, isString)
 		// The observer copies Pion's callback-owned buffer once immediately
@@ -187,6 +192,26 @@ func (c *dataChannel) handleMessage(b []byte, isString bool) (DataChannelMessage
 		event.Data = b
 		event.ParseOutcome = MessageParseNotAttempted
 		event.ReassemblyOutcome = MessageReassemblyNotApplicable
+	}
+	var captureParse func() error
+	if capturing {
+		capture := c.conn.capture
+		if captureErr := capture.Emit(CaptureEvent{Kind: "data-channel-segment", Peer: c.conn.capturePeer, Direction: captureDirection(c.conn.capturePeer, true), Data: b, Bytes: len(b), Channel: event.Label, Reliability: uint8(c.reliability), Outcome: "received"}); captureErr != nil {
+			return event, captureErr
+		}
+		pending := true
+		captureParse = func() error {
+			pending = false
+			return capture.Emit(CaptureEvent{Kind: "data-channel-parse", Peer: c.conn.capturePeer, Direction: captureDirection(c.conn.capturePeer, true), Channel: event.Label, Reliability: uint8(c.reliability), SegmentIndex: event.SegmentIndex, SegmentCount: event.SegmentCount, ParseOutcome: string(event.ParseOutcome), ReassemblyOutcome: string(event.ReassemblyOutcome), Outcome: ioOutcome(err), Err: errorString(err)})
+		}
+		defer func() {
+			if pending {
+				if captureErr := captureParse(); captureErr != nil {
+					err = captureErr
+					event.Err = captureErr
+				}
+			}
+		}()
 	}
 	select {
 	case <-c.close:
@@ -253,20 +278,34 @@ func (c *dataChannel) handleMessage(b []byte, isString bool) (DataChannelMessage
 	}
 	if observing {
 		event.ReassemblyOutcome = MessageReassemblyComplete
-		// c.data is handed to the packet receiver below, so the observation
-		// needs its own one-time copy before that ownership transfer.
-		event.ReassembledData = slices.Clone(c.data)
+		if c.conn.observeDataChannelMessage != nil {
+			// The observer needs its own copy before packet ownership transfers.
+			event.ReassembledData = slices.Clone(c.data)
+		}
 	}
 	c.totalSegments = 0
 	c.receivedSegments = 0
+	packet := c.data
+	if capturing {
+		// Failure handlers may close the channel, so invoke them outside messageMu.
+		c.data = nil
+		c.messageMu.Unlock()
+		if captureErr := captureParse(); captureErr != nil {
+			return event, captureErr
+		}
+	}
 
 	select {
 	case <-c.close:
 		err = net.ErrClosed
-	case c.packets <- c.data:
-		c.data = nil
+	case c.packets <- packet:
+		if !capturing {
+			c.data = nil
+		}
 	}
-	c.messageMu.Unlock()
+	if !capturing {
+		c.messageMu.Unlock()
+	}
 	if err != nil {
 		if observing {
 			event.Err = err

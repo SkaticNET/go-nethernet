@@ -111,6 +111,9 @@ type Signal struct {
 	// included to the String representation to be signaled to the remote network. If sent by
 	// a server, it represents the sender ID. If sent by a client, it represents the recipient ID.
 	NetworkID string
+
+	// Capture is local-only metadata carried from HTTP request admission to its Conn.
+	Capture *Capture
 }
 
 // MarshalText returns the bytes of a string representation returned from [Signal.String].

@@ -3,12 +3,110 @@ package nethernet
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"net"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 )
+
+type closeTestNegotiator struct{}
+
+func (closeTestNegotiator) handleClose(*Conn) {}
+func (closeTestNegotiator) log() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+func TestConnCloseCaptureFailureCanReenterClose(t *testing.T) {
+	var events atomic.Int32
+	done := make(chan struct{})
+	capture := &Capture{Event: func(event CaptureEvent) error {
+		if event.Kind == "connection-state" && event.Outcome == "closed" {
+			events.Add(1)
+			return errors.New("synthetic final write failure")
+		}
+		return nil
+	}, Done: func() { close(done) }}
+	release, err := capture.TryRetain()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := newConn(webrtc.NewAPI(), webrtc.ICEGatherOptions{}, 1, "remote", "local", closeTestNegotiator{}, ErrorCodeGenericFailure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.capture = capture
+	conn.capturePeer = "downstream"
+	conn.releaseCapture = release
+	capture.SetFailureHandler(func(error) { _ = conn.Close() })
+
+	closed := make(chan error, 1)
+	go func() { closed <- conn.Close() }()
+	select {
+	case err := <-closed:
+		if err == nil || err.Error() != "synthetic final write failure" {
+			t.Fatalf("Close() error = %v, want final capture write failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Conn.Close deadlocked when failure handler reentered Close")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("capture did not reach terminal close")
+	}
+	if got := events.Load(); got != 1 {
+		t.Fatalf("final connection-state events = %d, want exactly one", got)
+	}
+}
+
+func TestCaptureParseFailureCanCloseConnectionBeforeDelivery(t *testing.T) {
+	api := webrtc.NewAPI()
+	conn, err := newConn(api, webrtc.ICEGatherOptions{}, 1, "remote", "local", closeTestNegotiator{}, ErrorCodeGenericFailure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	peer, err := api.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	dc, err := peer.CreateDataChannel(MessageReliabilityReliable.Parameters().Label, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := wrapDataChannel(dc, MessageReliabilityReliable, conn)
+	conn.storeChannel(MessageReliabilityReliable, channel)
+	captureErr := errors.New("controlled parse capture failure")
+	conn.capture = &Capture{Event: func(event CaptureEvent) error {
+		if event.Kind == "data-channel-parse" {
+			return captureErr
+		}
+		return nil
+	}}
+	conn.capture.SetFailureHandler(func(error) { _ = conn.Close() })
+	returned := make(chan error, 1)
+	go func() {
+		_, err := channel.handleMessage([]byte{0, 'a'}, false)
+		returned <- err
+	}()
+	select {
+	case err := <-returned:
+		if !errors.Is(err, captureErr) {
+			t.Fatalf("handleMessage() error = %v, want capture failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("capture failure deadlocked with connection teardown")
+	}
+	select {
+	case <-conn.Context().Done():
+	default:
+		t.Fatal("capture failure did not close the connection")
+	}
+}
 
 func TestClosedWriteError(t *testing.T) {
 	t.Run("preserves cause", func(t *testing.T) {
