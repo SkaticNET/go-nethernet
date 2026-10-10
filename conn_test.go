@@ -267,6 +267,76 @@ func TestDescriptionEncodeKeepsDummyAddressForHostnameCandidate(t *testing.T) {
 	}
 }
 
+func TestDescriptionEncodeKeepsICEContractAndOmitsRedundantCandidateExtensions(t *testing.T) {
+	const ufrag = "abcdefghijklmnop"
+	data, err := (description{
+		ice: webrtc.ICEParameters{UsernameFragment: ufrag, Password: "abcdefghijklmnopqrstuvwx"},
+		dtls: webrtc.DTLSParameters{Role: webrtc.DTLSRoleAuto, Fingerprints: []webrtc.DTLSFingerprint{{
+			Algorithm: "sha-256",
+			Value:     "AA:BB",
+		}}},
+		candidates: []webrtc.ICECandidate{
+			{Foundation: "1", Component: 1, Protocol: webrtc.ICEProtocolUDP, Priority: 2130706431, Address: "192.0.2.1", Port: 40000, Typ: webrtc.ICECandidateTypeHost},
+			{Foundation: "2", Component: 1, Protocol: webrtc.ICEProtocolUDP, Priority: 2122194687, Address: "2001:db8::1", Port: 40001, Typ: webrtc.ICECandidateTypeHost},
+		},
+	}).encode()
+	if err != nil {
+		t.Fatalf("encode() error = %v", err)
+	}
+
+	var session sdp.SessionDescription
+	if err := session.Unmarshal(data); err != nil {
+		t.Fatalf("unmarshal SDP: %v", err)
+	}
+	if len(session.MediaDescriptions) != 1 {
+		t.Fatalf("media sections = %d, want 1", len(session.MediaDescriptions))
+	}
+	media := session.MediaDescriptions[0]
+	for key, want := range map[string]string{
+		"ice-ufrag":   ufrag,
+		"ice-pwd":     "abcdefghijklmnopqrstuvwx",
+		"fingerprint": "sha-256 AA:BB",
+		"setup":       "actpass",
+		"ice-options": "trickle",
+	} {
+		got, ok := media.Attribute(key)
+		if !ok || got != want {
+			t.Errorf("%s = %q, present = %t; want %q", key, got, ok, want)
+		}
+	}
+
+	var candidates []string
+	for _, attribute := range media.Attributes {
+		if attribute.IsICECandidate() {
+			candidates = append(candidates, attribute.Value)
+		}
+	}
+	wantCandidates := []string{
+		"candidate:1 1 udp 2130706431 192.0.2.1 40000 typ host generation 0 network-id 0",
+		"candidate:2 1 udp 2122194687 2001:db8::1 40001 typ host generation 0 network-id 1",
+	}
+	if len(candidates) != len(wantCandidates) {
+		t.Fatalf("candidate count = %d, want %d", len(candidates), len(wantCandidates))
+	}
+	for i, want := range wantCandidates {
+		if candidates[i] != want {
+			t.Errorf("candidate %d = %q, want %q", i, candidates[i], want)
+		}
+	}
+}
+
+func TestTrickleCandidateKeepsICEUsernameFragment(t *testing.T) {
+	candidate := webrtc.ICECandidate{
+		Foundation: "1", Component: 1, Protocol: webrtc.ICEProtocolUDP,
+		Priority: 2130706431, Address: "192.0.2.1", Port: 40000, Typ: webrtc.ICECandidateTypeHost,
+	}
+	got := formatICECandidate(0, candidate, webrtc.ICEParameters{UsernameFragment: "abcdefghijklmnop"}, true)
+	want := "candidate:1 1 udp 2130706431 192.0.2.1 40000 typ host generation 0 ufrag abcdefghijklmnop network-id 0"
+	if got != want {
+		t.Fatalf("trickle candidate = %q, want %q", got, want)
+	}
+}
+
 func TestParseDescriptionRejectsMessageSizesWithoutFragmentPayload(t *testing.T) {
 	for _, max := range []string{"0", "1"} {
 		t.Run(max, func(t *testing.T) {

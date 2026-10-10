@@ -701,7 +701,7 @@ func (conn *Conn) trickleCandidates(signaling Signaling) error {
 		}
 		// Signal the local candidate in a goroutine so candidate gathering is never blocked by signaling.
 		// It uses [Conn.Context] as the parent context so signaling stops once the connection is closed.
-		go conn.trickleCandidate(signaling, formatICECandidate(int(candidateIndex.Add(1)-1), *candidate, conn.description.ice))
+		go conn.trickleCandidate(signaling, formatICECandidate(int(candidateIndex.Add(1)-1), *candidate, conn.description.ice, true))
 	})
 	return conn.gatherer.Gather()
 }
@@ -876,7 +876,7 @@ func (desc description) encode() ([]byte, error) {
 	for i, candidate := range desc.candidates {
 		media.Attributes = append(media.Attributes, sdp.Attribute{
 			Key:   sdp.AttrKeyCandidate,
-			Value: formatICECandidate(i, candidate, desc.ice),
+			Value: formatICECandidate(i, candidate, desc.ice, false),
 		})
 	}
 

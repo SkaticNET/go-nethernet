@@ -184,7 +184,7 @@ func (s *Signal) String() string {
 // It returns a string in the format used by the C++ implementation of WebRTC. Local ICE candidates
 // gathered by [webrtc.ICEGatherer] should be formatted with formatICECandidate when signaling to a remote
 // network, otherwise it will be ignored.
-func formatICECandidate(id int, candidate webrtc.ICECandidate, iceParams webrtc.ICEParameters) string {
+func formatICECandidate(id int, candidate webrtc.ICECandidate, iceParams webrtc.ICEParameters, includeUfrag bool) string {
 	b := &strings.Builder{}
 	b.WriteString("candidate:")
 	b.WriteString(candidate.Foundation)
@@ -217,17 +217,16 @@ func formatICECandidate(id int, candidate webrtc.ICECandidate, iceParams webrtc.
 	b.WriteByte(' ')
 	b.WriteByte('0')
 	b.WriteByte(' ')
-	b.WriteString("ufrag")
-	b.WriteByte(' ')
-	b.WriteString(iceParams.UsernameFragment)
-	b.WriteByte(' ')
+	if includeUfrag {
+		// Separate trickle signals need the ufrag to correlate candidates with an ICE generation.
+		b.WriteString("ufrag")
+		b.WriteByte(' ')
+		b.WriteString(iceParams.UsernameFragment)
+		b.WriteByte(' ')
+	}
 	b.WriteString("network-id")
 	b.WriteByte(' ')
 	b.WriteString(strconv.Itoa(id))
-	b.WriteByte(' ')
-	b.WriteString("network-cost")
-	b.WriteByte(' ')
-	b.WriteByte('0')
 	return b.String()
 }
 
